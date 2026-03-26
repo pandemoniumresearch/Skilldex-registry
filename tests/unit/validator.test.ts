@@ -1,0 +1,119 @@
+import { describe, it, expect } from "vitest";
+import { readFileSync } from "fs";
+import { join } from "path";
+import { validateSkill } from "../../src/validator/index.js";
+
+const fixturesDir = join(import.meta.dirname, "..", "fixtures");
+
+function readFixture(name: string): string {
+  return readFileSync(join(fixturesDir, name), "utf-8");
+}
+
+describe("validateSkill", () => {
+  it("gives a perfect score to a valid skill", () => {
+    const result = validateSkill({
+      skillMd: readFixture("valid-skill.md"),
+      files: ["scripts/analyze.sh", "references/guide.md"],
+    });
+
+    expect(result.score).toBe(100);
+    expect(result.diagnostics).toHaveLength(0);
+  });
+
+  it("returns score 0 for missing frontmatter", () => {
+    const result = validateSkill({
+      skillMd: readFixture("no-frontmatter-skill.md"),
+      files: [],
+    });
+
+    expect(result.score).toBe(0);
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0].level).toBe("error");
+    expect(result.diagnostics[0].message).toContain("frontmatter");
+  });
+
+  it("deducts points for short description", () => {
+    const result = validateSkill({
+      skillMd: readFixture("short-description-skill.md"),
+      files: [],
+    });
+
+    expect(result.score).toBeLessThan(100);
+    const descDiag = result.diagnostics.find((d) =>
+      d.message.includes("words")
+    );
+    expect(descDiag).toBeDefined();
+    expect(descDiag!.level).toBe("error");
+  });
+
+  it("deducts points for missing name field", () => {
+    const result = validateSkill({
+      skillMd: readFixture("missing-name-skill.md"),
+      files: [],
+    });
+
+    expect(result.score).toBeLessThan(100);
+    const nameDiag = result.diagnostics.find((d) =>
+      d.message.includes("name")
+    );
+    expect(nameDiag).toBeDefined();
+  });
+
+  it("warns about unknown subdirectories", () => {
+    const result = validateSkill({
+      skillMd: readFixture("valid-skill.md"),
+      files: ["bin/run.sh", "scripts/analyze.sh"],
+    });
+
+    const dirDiag = result.diagnostics.find((d) =>
+      d.message.includes("Unknown subdirectory")
+    );
+    expect(dirDiag).toBeDefined();
+    expect(dirDiag!.level).toBe("warning");
+  });
+
+  it("flags broken resource references", () => {
+    const skillMd = readFixture("valid-skill.md") +
+      "\n\nSee [template](assets/template.docx) for details.";
+
+    const result = validateSkill({
+      skillMd,
+      files: ["scripts/analyze.sh"],
+    });
+
+    const refDiag = result.diagnostics.find((d) =>
+      d.message.includes("not found")
+    );
+    expect(refDiag).toBeDefined();
+    expect(refDiag!.level).toBe("error");
+  });
+
+  it("warns about misplaced files", () => {
+    const result = validateSkill({
+      skillMd: readFixture("valid-skill.md"),
+      files: ["references/run.sh", "scripts/notes.md"],
+    });
+
+    const misplaced = result.diagnostics.filter((d) =>
+      d.message.includes("found in")
+    );
+    expect(misplaced).toHaveLength(2);
+    expect(misplaced.every((d) => d.level === "warning")).toBe(true);
+  });
+
+  it("caps score at 0 minimum", () => {
+    // Skill with many issues
+    const skillMd = `---
+description: Short.
+spec_version: "1.0"
+---
+` + "\n".repeat(510);
+
+    const result = validateSkill({
+      skillMd,
+      files: ["bin/x", "lib/y", "tmp/z"],
+    });
+
+    expect(result.score).toBeGreaterThanOrEqual(0);
+  });
+});
