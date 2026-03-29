@@ -6,6 +6,9 @@ import { installRoutes } from "./routes/install.js";
 import { publishRoutes } from "./routes/publish.js";
 import { authRoutes } from "./routes/auth.js";
 import { specRoutes } from "./routes/spec.js";
+import { skillsetsRoutes } from "./routes/skillsets.js";
+import { skillsetsInstallRoutes } from "./routes/skillsets-install.js";
+import { skillsetsPublishRoutes } from "./routes/skillsets-publish.js";
 import { errorHandler } from "./middleware/errorHandler.js";
 import { rateLimit } from "./middleware/rateLimit.js";
 
@@ -26,6 +29,13 @@ v1.route("/skills", installRoutes);
 v1.route("/skills", publishRoutes);
 v1.route("/auth", authRoutes);
 v1.route("/spec-versions", specRoutes);
+
+v1.use("/skillsets", rateLimit({ max: 100, windowMs: 60_000 }));
+v1.use("/skillsets/*/install", rateLimit({ max: 500, windowMs: 60_000 }));
+
+v1.route("/skillsets", skillsetsRoutes);
+v1.route("/skillsets", skillsetsInstallRoutes);
+v1.route("/skillsets", skillsetsPublishRoutes);
 
 app.route("/v1", v1);
 
