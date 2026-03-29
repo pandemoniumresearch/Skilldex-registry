@@ -1,13 +1,16 @@
 /**
- * Seed script for Skilldex Registry.
+ * Skilldex Registry — skill sync script.
  *
- * Seeds the registry with:
- * 1. The skilldex-official publisher account
- * 2. Spec version v1.0 (current)
- * 3. Skills discovered from known repos (verified + community)
+ * Reads watched_repos from Supabase, discovers SKILL.md files in each repo,
+ * and inserts only net-new skills (existing source_urls are skipped without
+ * making any GitHub API calls).
  *
- * Usage: npm run seed
- * Requires: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars
+ * Usage:
+ *   npm run seed      — local (loads .env)
+ *   npm run seed:ci   — CI (reads env vars from environment)
+ *
+ * Required env vars: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+ * Optional:          GITHUB_TOKEN (raises GitHub API rate limit to 5000/hr)
  */
 
 import { createClient } from "@supabase/supabase-js";
@@ -25,45 +28,8 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// Repos to scan for SKILL.md files.
-// All skills discovered retain their original source_url (attribution back to the repo)
-// and author (the repo owner's GitHub handle).
-const SEED_REPOS: Array<{
-  owner: string;
-  repo: string;
-  branch?: string;
-  trust_tier: "verified" | "community";
-  tags?: string[];
-}> = [
-  {
-    owner: "anthropics",
-    repo: "skills",
-    branch: "main",
-    trust_tier: "verified",
-    tags: ["official"],
-  },
-  {
-    owner: "ComposioHQ",
-    repo: "awesome-claude-skills",
-    branch: "main",
-    trust_tier: "community",
-    tags: ["composio"],
-  },
-  {
-    owner: "sickn33",
-    repo: "antigravity-awesome-skills",
-    branch: "main",
-    trust_tier: "community",
-  },
-  {
-    owner: "alirezarezvani",
-    repo: "claude-skills",
-    branch: "main",
-    trust_tier: "community",
-  },
-];
-
-// Delay between GitHub API calls to stay within rate limits
+// Delay between GitHub API calls to stay within rate limits.
+// 300ms → ~200 req/min, well within the 5000/hr authenticated limit.
 const DELAY_MS = 300;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -79,7 +45,7 @@ function githubHeaders(): Record<string, string> {
 async function discoverSkillPaths(
   owner: string,
   repo: string,
-  branch: string = "main"
+  branch: string
 ): Promise<string[]> {
   const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
   const res = await fetch(url, { headers: githubHeaders() });
@@ -95,7 +61,7 @@ async function discoverSkillPaths(
   };
 
   if (data.truncated) {
-    console.warn(`  Warning: tree for ${owner}/${repo} is truncated (>100k files)`);
+    console.warn(`  Warning: tree for ${owner}/${repo} is truncated`);
   }
 
   return data.tree
@@ -107,29 +73,17 @@ async function discoverSkillPaths(
 }
 
 async function seed() {
-  console.log("Seeding Skilldex Registry...\n");
+  console.log("Skilldex Registry — skill sync\n");
 
-  // 1. Seed spec versions
-  console.log("Seeding spec versions...");
+  // 1. Ensure spec version exists
   const { error: specError } = await supabase.from("spec_versions").upsert(
-    [
-      {
-        version: "1.0",
-        released_at: "2026-03-26T00:00:00.000Z",
-        changelog_url: null,
-        is_current: true,
-      },
-    ],
+    [{ version: "1.0", released_at: "2026-03-26T00:00:00.000Z", is_current: true }],
     { onConflict: "version" }
   );
-  if (specError) {
-    console.error("Failed to seed spec versions:", specError.message);
-  } else {
-    console.log("  ✓ spec_versions seeded (v1.0 = current)");
-  }
+  if (specError) console.warn("spec_versions upsert:", specError.message);
+  else console.log("✓ spec_versions ready");
 
-  // 2. Create the official publisher account
-  console.log("\nSeeding official publisher...");
+  // 2. Ensure official publisher exists
   const { data: publisher, error: pubError } = await supabase
     .from("publishers")
     .upsert(
@@ -140,32 +94,61 @@ async function seed() {
     .single();
 
   if (pubError || !publisher) {
-    console.error("Failed to seed publisher:", pubError?.message);
+    console.error("Failed to ensure publisher:", pubError?.message);
     return;
   }
-  console.log(`  ✓ Publisher: ${publisher.github_handle} (verified)`);
+  console.log(`✓ Publisher ready: ${publisher.github_handle}\n`);
 
-  // 3. Seed skills from each repo
+  // 3. Load watched repos from DB (single source of truth)
+  const { data: watchedRepos, error: reposError } = await supabase
+    .from("watched_repos")
+    .select("*")
+    .eq("enabled", true)
+    .order("added_at");
+
+  if (reposError || !watchedRepos) {
+    console.error("Failed to load watched_repos:", reposError?.message);
+    return;
+  }
+  console.log(`Loaded ${watchedRepos.length} watched repos from DB`);
+
+  // 4. Pre-load all existing source_urls to avoid redundant GitHub API calls
+  const { data: existingSkills } = await supabase
+    .from("skills")
+    .select("source_url");
+
+  const existingUrls = new Set(
+    (existingSkills ?? []).map((s: { source_url: string }) => s.source_url)
+  );
+  console.log(`${existingUrls.size} skills already in registry\n`);
+
+  // 5. Process each repo
   let totalInserted = 0;
   let totalSkipped = 0;
   let totalFailed = 0;
 
-  for (const repo of SEED_REPOS) {
-    const branch = repo.branch ?? "main";
+  for (const watched of watchedRepos) {
+    const { owner, repo, branch, trust_tier, tags } = watched;
+    console.log(`Scanning ${owner}/${repo} [${trust_tier}]...`);
+
+    const allPaths = await discoverSkillPaths(owner, repo, branch ?? "main");
+    const newPaths = allPaths.filter((p) => !existingUrls.has(p));
+
     console.log(
-      `\nScanning ${repo.owner}/${repo.repo} (${repo.trust_tier})...`
+      `  ${allPaths.length} skills found, ${newPaths.length} new`
     );
 
-    const skillPaths = await discoverSkillPaths(repo.owner, repo.repo, branch);
-
-    if (skillPaths.length === 0) {
-      console.log("  No SKILL.md files found — skipping");
+    if (newPaths.length === 0) {
+      // Update last_scanned_at even when nothing is new
+      await supabase
+        .from("watched_repos")
+        .update({ last_scanned_at: new Date().toISOString() })
+        .eq("id", watched.id);
+      totalSkipped += allPaths.length;
       continue;
     }
 
-    console.log(`  Found ${skillPaths.length} skills`);
-
-    for (const sourceUrl of skillPaths) {
+    for (const sourceUrl of newPaths) {
       await sleep(DELAY_MS);
 
       try {
@@ -182,51 +165,56 @@ async function seed() {
           files: metadata.files,
         });
 
-        const { data: inserted, error } = await supabase.from("skills").upsert(
-          [
-            {
-              name: metadata.name,
-              description: metadata.description || metadata.name,
-              // Attribution: original repo owner credited as author.
-              // source_url links directly back to the original folder in the source repo.
-              author: repo.owner,
-              source_url: sourceUrl,
-              trust_tier: repo.trust_tier,
-              score: validation.score,
-              spec_version: metadata.spec_version ?? "1.0",
-              tags: [
-                ...(repo.tags ?? []),
-                ...(metadata as any).tags ?? [],
-              ],
-              published_by: publisher.id,
-            },
-          ],
-          { onConflict: "name", ignoreDuplicates: true }
-        ).select("name");
+        const { data: inserted, error } = await supabase
+          .from("skills")
+          .upsert(
+            [
+              {
+                name: metadata.name,
+                description: metadata.description || metadata.name,
+                author: owner,
+                source_url: sourceUrl,
+                trust_tier,
+                score: validation.score,
+                spec_version: metadata.spec_version ?? "1.0",
+                tags: [...(tags ?? []), ...((metadata as any).tags ?? [])],
+                published_by: publisher.id,
+              },
+            ],
+            { onConflict: "name", ignoreDuplicates: true }
+          )
+          .select("name");
 
         if (error) {
           console.log(`  ✗ ${metadata.name}: ${error.message}`);
           totalFailed++;
         } else if (!inserted || inserted.length === 0) {
-          console.log(`  ~ ${metadata.name} (already exists, skipped)`);
+          console.log(`  ~ ${metadata.name} (name conflict, skipped)`);
           totalSkipped++;
         } else {
-          console.log(
-            `  ✓ ${metadata.name} (score: ${validation.score}, author: ${repo.owner})`
-          );
+          console.log(`  ✓ ${metadata.name} (score: ${validation.score})`);
           totalInserted++;
+          existingUrls.add(sourceUrl); // keep local set in sync
         }
       } catch (err: any) {
-        console.log(`  ✗ Failed: ${sourceUrl} — ${err.message}`);
+        console.log(`  ✗ ${sourceUrl}: ${err.message}`);
         totalFailed++;
       }
     }
+
+    // Mark repo as scanned
+    await supabase
+      .from("watched_repos")
+      .update({ last_scanned_at: new Date().toISOString() })
+      .eq("id", watched.id);
   }
 
-  console.log(`\nDone! Inserted: ${totalInserted}, Skipped: ${totalSkipped}, Failed: ${totalFailed}`);
+  console.log(
+    `\nDone! Inserted: ${totalInserted}, Skipped: ${totalSkipped}, Failed: ${totalFailed}`
+  );
 }
 
 seed().catch((err) => {
-  console.error("Seed failed:", err);
+  console.error("Sync failed:", err);
   process.exit(1);
 });
