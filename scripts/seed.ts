@@ -147,6 +147,7 @@ async function seed() {
 
   // 3. Seed skills from each repo
   let totalInserted = 0;
+  let totalSkipped = 0;
   let totalFailed = 0;
 
   for (const repo of SEED_REPOS) {
@@ -181,7 +182,7 @@ async function seed() {
           files: metadata.files,
         });
 
-        const { error } = await supabase.from("skills").upsert(
+        const { data: inserted, error } = await supabase.from("skills").upsert(
           [
             {
               name: metadata.name,
@@ -200,12 +201,15 @@ async function seed() {
               published_by: publisher.id,
             },
           ],
-          { onConflict: "name" }
-        );
+          { onConflict: "name", ignoreDuplicates: true }
+        ).select("name");
 
         if (error) {
           console.log(`  ✗ ${metadata.name}: ${error.message}`);
           totalFailed++;
+        } else if (!inserted || inserted.length === 0) {
+          console.log(`  ~ ${metadata.name} (already exists, skipped)`);
+          totalSkipped++;
         } else {
           console.log(
             `  ✓ ${metadata.name} (score: ${validation.score}, author: ${repo.owner})`
@@ -219,7 +223,7 @@ async function seed() {
     }
   }
 
-  console.log(`\nDone! Inserted: ${totalInserted}, Failed: ${totalFailed}`);
+  console.log(`\nDone! Inserted: ${totalInserted}, Skipped: ${totalSkipped}, Failed: ${totalFailed}`);
 }
 
 seed().catch((err) => {
