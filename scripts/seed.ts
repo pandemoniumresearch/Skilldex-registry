@@ -112,14 +112,18 @@ async function seed() {
   }
   console.log(`Loaded ${watchedRepos.length} watched repos from DB`);
 
-  // 4. Pre-load all existing source_urls to avoid redundant GitHub API calls
-  const { data: existingSkills } = await supabase
-    .from("skills")
-    .select("source_url");
+  // 4. Pre-load all existing source_urls to avoid redundant GitHub API calls.
+  //    Includes skills already inserted AND urls previously seen but skipped
+  //    due to name conflicts — prevents re-fetching them every run.
+  const [{ data: existingSkills }, { data: seenUrls }] = await Promise.all([
+    supabase.from("skills").select("source_url"),
+    supabase.from("seen_source_urls").select("url"),
+  ]);
 
-  const existingUrls = new Set(
-    (existingSkills ?? []).map((s: { source_url: string }) => s.source_url)
-  );
+  const existingUrls = new Set([
+    ...(existingSkills ?? []).map((s: { source_url: string }) => s.source_url),
+    ...(seenUrls ?? []).map((s: { url: string }) => s.url),
+  ]);
   console.log(`${existingUrls.size} skills already in registry\n`);
 
   // 5. Process each repo
@@ -191,6 +195,11 @@ async function seed() {
         } else if (!inserted || inserted.length === 0) {
           console.log(`  ~ ${metadata.name} (name conflict, skipped)`);
           totalSkipped++;
+          // Persist so future runs don't re-fetch this url
+          await supabase
+            .from("seen_source_urls")
+            .upsert([{ url: sourceUrl }], { onConflict: "url", ignoreDuplicates: true });
+          existingUrls.add(sourceUrl);
         } else {
           console.log(`  ✓ ${metadata.name} (score: ${validation.score})`);
           totalInserted++;
