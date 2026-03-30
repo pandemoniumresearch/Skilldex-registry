@@ -1,9 +1,5 @@
 import { parse as parseYaml } from "yaml";
-
-export interface SkillRef {
-  name: string;
-  source_url: string;
-}
+import type { SkillRef } from "../types/skillset.js";
 
 export interface SkillsetMetadata {
   name: string;
